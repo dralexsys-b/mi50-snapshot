@@ -1,0 +1,16 @@
+# Архивы и бэкапы
+*.tar.gz
+*.zip
+*.bak
+
+# Временные файлы
+*.tmp
+*.log
+
+# Локальные настройки
+.env
+*.local
+
+# Папки с бэкапами
+rocm_llama_backups/
+backups/

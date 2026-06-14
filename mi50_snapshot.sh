@@ -191,12 +191,18 @@ fi
 cat > restore.sh << 'REOF'
 #!/bin/bash
 set -e
+cd "$(dirname "$0")" || exit 1
+echo "📁 Работаю из: $(pwd)"
 echo "🔄 Восстанавливаю ROCm + llama.cpp для gfx906..."
+
+REAL_HOME=$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)
+[ -z "$REAL_HOME" ] && REAL_HOME="$HOME"
+echo "👤 Целевой пользователь: ${SUDO_USER:-$USER} ($REAL_HOME)"
 
 [ -f SHA256SUMS.txt ] && sha256sum -c SHA256SUMS.txt --quiet || true
 
 # 1. Базовые зависимости
-sudo apt update
+sudo apt update || true
 [ -f required_dev_deps.txt ] && xargs -a required_dev_deps.txt sudo apt install -y --no-install-recommends || true
 
 # 2. APT configs
@@ -204,11 +210,13 @@ if [ -f apt_configs.tar.gz ]; then
     tar -xzf apt_configs.tar.gz
     sudo cp -f apt_configs/*.list /etc/apt/sources.list.d/ 2>/dev/null || true
     sudo cp -f apt_configs/*.gpg /etc/apt/keyrings/ 2>/dev/null || true
-    sudo apt update && rm -rf apt_configs/
+    sudo apt update || echo "⚠️ apt update failed, continuing"
+    rm -rf apt_configs/
 fi
 
 # 3. ROCm Runtime
 if [ -f rocm_runtime_backup.tar.gz ]; then
+    echo "📦 Восстанавливаю ROCm runtime..."
     sudo tar -xzPf rocm_runtime_backup.tar.gz
     sudo chmod -R a+x /opt/rocm*/bin 2>/dev/null || true
 fi
@@ -220,6 +228,7 @@ fi
 
 # 4. gfx906 Tensile patches
 if [ -f gfx906_patch.tar.gz ]; then
+    echo "🔥 Восстанавливаю gfx906 Tensile-патчи..."
     tar -xzf gfx906_patch.tar.gz
     sudo cp gfx906_patch/* /opt/rocm/lib/rocblas/library/ 2>/dev/null || true
     rm -rf gfx906_patch
@@ -234,90 +243,110 @@ if [ -f gfx906_blob_manifest.txt ]; then
 fi
 
 # 5. HIP Cache
-[ -f hip_cache.tar.gz ] && tar -xzf hip_cache.tar.gz -C "$HOME"
+[ -f hip_cache.tar.gz ] && tar -xzf hip_cache.tar.gz -C "$REAL_HOME"
 
-# 6. llama.cpp — все версии
-for archive in *llama*_source_backup.tar.gz; do [ -f "$archive" ] && tar -xzf "$archive" -C "$HOME"; done
+# 6. llama.cpp исходники
+for archive in *llama*_source_backup.tar.gz; do
+    [ -f "$archive" ] && tar -xzf "$archive" -C "$REAL_HOME"
+done
+
+# 7. llama.cpp бинарники с проверкой HIP
+HIP_RESTORED=0
 for bin_archive in *llama*_build_bin.tar.gz; do
     if [ -f "$bin_archive" ]; then
         dirname=$(echo "$bin_archive" | sed -E 's/_(HIP|CPU_ONLY)_build_bin\.tar\.gz$//')
-        llama_dir=$(find "$HOME" -maxdepth 3 -type d -name "$dirname" 2>/dev/null | head -n1)
-        if [ -n "$llama_dir" ]; then
+        llama_dir=$(find "$REAL_HOME" -maxdepth 3 -type d -name "$dirname" 2>/dev/null | head -n1)
+        if [ -z "$llama_dir" ]; then
+            llama_dir="$REAL_HOME/$dirname"
+            mkdir -p "$llama_dir"
+        fi
+        if [[ "$bin_archive" == *"_HIP_"* ]] || [ "$HIP_RESTORED" -eq 0 ]; then
+            echo "📦 Распаковываю: $bin_archive → $llama_dir"
             mkdir -p "$llama_dir/build"
             tar -xzf "$bin_archive" -C "$llama_dir/build"
             chmod -R +x "$llama_dir/build/bin" 2>/dev/null || true
+            if [[ "$bin_archive" == *"_HIP_"* ]]; then
+                [ -f "$llama_dir/build/bin/llama-cli" ] || {
+                    echo "❌ HIP archive restored but llama-cli missing"
+                    exit 1
+                }
+                ls "$llama_dir/build/bin"/libggml-hip.so* >/dev/null 2>&1 || {
+                    echo "❌ HIP archive restored but libggml-hip.so missing"
+                    exit 1
+                }
+                echo "✅ HIP binaries verified"
+                HIP_RESTORED=1
+            fi
+        else
+            echo "⏭️  Пропускаю CPU_ONLY: $bin_archive (HIP уже восстановлен)"
         fi
     fi
 done
 
-# 7. Делаем HIP-версию основной как ~/llama.cpp
+# 8. Делаем HIP-версию основной
 if [ -f working_hip_llama_path.txt ]; then
     HIP_PATH=$(cat working_hip_llama_path.txt)
     HIP_DIRNAME=$(basename "$HIP_PATH")
-    
-    if [ "$HIP_DIRNAME" != "llama.cpp" ] && [ -d "$HOME/$HIP_DIRNAME" ]; then
-        [ -d "$HOME/llama.cpp" ] && mv "$HOME/llama.cpp" "$HOME/llama.cpp.non_hip_backup"
-        mv "$HOME/$HIP_DIRNAME" "$HOME/llama.cpp"
+    if [ "$HIP_DIRNAME" != "llama.cpp" ] && [ -d "$REAL_HOME/$HIP_DIRNAME" ]; then
+        [ -d "$REAL_HOME/llama.cpp" ] && mv "$REAL_HOME/llama.cpp" "$REAL_HOME/llama.cpp.non_hip_backup"
+        mv "$REAL_HOME/$HIP_DIRNAME" "$REAL_HOME/llama.cpp"
         echo "✅ Переименовал $HIP_DIRNAME → llama.cpp (HIP-версия)"
     fi
-    
-    mkdir -p "$HOME/bin"
-    ln -sf "$HOME/llama.cpp/build/bin/llama-cli" "$HOME/bin/"
-    ln -sf "$HOME/llama.cpp/build/bin/llama-server" "$HOME/bin/"
-    ln -sf "$HOME/llama.cpp/build/bin/llama-bench" "$HOME/bin/"
-    echo "✅ ~/bin симлинки созданы"
+    mkdir -p "$REAL_HOME/bin"
+    ln -sf "$REAL_HOME/llama.cpp/build/bin/llama-cli" "$REAL_HOME/bin/" 2>/dev/null || true
+    ln -sf "$REAL_HOME/llama.cpp/build/bin/llama-server" "$REAL_HOME/bin/" 2>/dev/null || true
+    ln -sf "$REAL_HOME/llama.cpp/build/bin/llama-bench" "$REAL_HOME/bin/" 2>/dev/null || true
+    echo "✅ $REAL_HOME/bin симлинки созданы"
 fi
 
-# 8. Launch scripts
+# 9. Launch scripts
 [ -f launch_scripts.tar.gz ] && tar -xzf launch_scripts.tar.gz
 
-# 9. ld.so.conf.d (ВАЖНО для симлинков!)
+# 10. ld.so.conf.d
 if [ -f ldconf_backup.tar.gz ]; then
     sudo tar -xzf ldconf_backup.tar.gz -C /etc/ld.so.conf.d/ 2>/dev/null || true
 fi
-
 echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm-llama.conf > /dev/null
-[ -d "$HOME/llama.cpp/build/bin" ] && echo "$HOME/llama.cpp/build/bin" | sudo tee -a /etc/ld.so.conf.d/rocm-llama.conf > /dev/null
+if [ -d "$REAL_HOME/llama.cpp/build/bin" ]; then
+    echo "$REAL_HOME/llama.cpp/build/bin" | sudo tee -a /etc/ld.so.conf.d/rocm-llama.conf > /dev/null
+    echo "✅ ld.so.conf: $REAL_HOME/llama.cpp/build/bin"
+fi
 sudo ldconfig
 
-# 10. .bashrc
+# 11. .bashrc
 if [ -f bashrc_backup.txt ]; then
-    if [ ! -f "$HOME/.bashrc" ] || [ -z "$(cat "$HOME/.bashrc")" ]; then
-        cp bashrc_backup.txt "$HOME/.bashrc"
-        echo "✅ .bashrc восстановлен"
+    if [ ! -f "$REAL_HOME/.bashrc" ] || [ -z "$(cat "$REAL_HOME/.bashrc" 2>/dev/null)" ]; then
+        cp bashrc_backup.txt "$REAL_HOME/.bashrc"
+        chown "${SUDO_USER:-$USER}:${SUDO_USER:-$USER}" "$REAL_HOME/.bashrc"
+        echo "✅ .bashrc восстановлен в $REAL_HOME"
     else
-        echo "⚠️ .bashrc уже существует. Для восстановления: cp bashrc_backup.txt ~/.bashrc"
+        echo "⚠️ .bashrc уже существует в $REAL_HOME"
     fi
 fi
 
-# 11. LD_LIBRARY_PATH + PATH fix
-export LD_LIBRARY_PATH=/opt/rocm/lib:"$HOME/llama.cpp/build/bin":${LD_LIBRARY_PATH:-}
-export PATH="$HOME/bin:/opt/rocm/bin:$PATH"
+# 12. Финальные переменные окружения
+export LD_LIBRARY_PATH=/opt/rocm/lib:"$REAL_HOME/llama.cpp/build/bin":${LD_LIBRARY_PATH:-}
+export PATH="$REAL_HOME/bin:/opt/rocm/bin:$PATH"
 hash -r
 
-# ==========================================
-# 🧪 ВАЛИДАЦИЯ
-# ==========================================
+# ВАЛИДАЦИЯ
 echo ""
 echo "🧪 Проверяю ROCm..."
-hipcc --version || echo "⚠️ hipcc не найден"
-rocminfo | grep gfx || echo "⚠️ rocminfo не видит GPU"
+hipcc --version 2>/dev/null | head -1 || echo "⚠️ hipcc не найден"
+rocminfo | grep -c gfx906 | xargs -I{} echo "✅ gfx906 устройств: {}"
 
 echo ""
 echo "🧪 Проверяю llama..."
-if [ -f "$HOME/llama.cpp/build/bin/llama-cli" ]; then
-    "$HOME/llama.cpp/build/bin/llama-cli" --list-devices || echo "⚠️ llama-cli не нашёл устройства"
+if [ -f "$REAL_HOME/llama.cpp/build/bin/llama-cli" ]; then
+    "$REAL_HOME/llama.cpp/build/bin/llama-cli" --list-devices || echo "⚠️ llama-cli не нашёл устройства"
     echo ""
     echo "🔬 GFX targets in binary:"
-    strings "$HOME/llama.cpp/build/bin/llama-cli" | grep -E "gfx[0-9]+" | sort -u | head -5
-    echo ""
-    echo "🔗 HIP/ROCm libraries:"
-    ldd "$HOME/llama.cpp/build/bin/llama-cli" | grep -E "hip|rocm" | head -5
+    strings "$REAL_HOME/llama.cpp/build/bin/llama-cli" | grep -E "gfx[0-9]+" | sort -u | head -5
 fi
 
 echo ""
-echo "✅ Готово! Среда восстановлена."
-echo "💡 Если симлинки не работают: exec bash"
+echo "✅ Готово! Среда восстановлена для ${SUDO_USER:-$USER}"
+echo "💡 Выполните 'exec bash' или перелогиньтесь для применения PATH"
 REOF
 chmod +x restore.sh
 
